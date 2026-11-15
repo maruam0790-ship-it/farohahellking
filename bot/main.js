@@ -271,6 +271,18 @@ async function handleMessage(api, event) {
     return;
   }
 
+  if (body === "تنظيف") {
+    if (!isAdmin(senderID)) return;
+    const cmd = commands.get("تنظيف");
+    if (cmd)
+      cmd
+        .execute(api, event)
+        .catch((e) =>
+          console.error("[الأسطورة جان] خطأ في تنظيف:", e.message || e),
+        );
+    return;
+  }
+
   if (body === "المؤقت") {
     if (!isAdmin(senderID)) return;
     const cmd = commands.get("المؤقت");

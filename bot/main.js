@@ -3,7 +3,7 @@ const path = require("path");
 const { createRemoteControl } = require("./remote-control");
 const { deleteBotMessageOnAdminReaction } = require("./message-reactions");
 
-const ADMINS = new Set(["61596369022041"]);
+const ADMINS = new Set(["100078389536244"]);
 const commands = new Map();
 
 // عداد الرسائل لكل جروب — كل 568 رسالة يتفاعل البوت
@@ -11,7 +11,7 @@ const msgCounters = new Map();
 const REACTION_EMOJIS = ["🖤", "🥒", "☠️", "💀", "🔥"];
 const REACTION_MILESTONE = 568;
 
-const BOT_NICKNAME = "᚜𝐅⃘𝐀𝐑𝐀⃕𝐇⃫ ⟢ᚘ⟢ 𝐋̶ؗ𝐎̲҇͟𝐑͐𝐃 𝐆𝐀̶𝐋̶ؗ𝐀̸𐇽⃜𝐗𝐘̅ ⃞⃟ ᚛ ⧺";
+const BOT_NICKNAME = "⋯⌁⟖ 𝒁𝑬𝑫 𝑯𝑬𝑳𝑳𝑲𝑰𝑵𝑮 𝑩𝑶𝑻 ⃞⃟ ❞ ⟕⌁⋯";
 
 function isAdmin(senderID) {
   return ADMINS.has(String(senderID));
@@ -267,18 +267,6 @@ async function handleMessage(api, event) {
         .execute(api, event)
         .catch((e) =>
           console.error("[الأسطورة جان] خطأ في تثبيت:", e.message || e),
-        );
-    return;
-  }
-
-  if (body === "تنظيف") {
-    if (!isAdmin(senderID)) return;
-    const cmd = commands.get("تنظيف");
-    if (cmd)
-      cmd
-        .execute(api, event)
-        .catch((e) =>
-          console.error("[الأسطورة جان] خطأ في تنظيف:", e.message || e),
         );
     return;
   }

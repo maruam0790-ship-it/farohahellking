@@ -134,8 +134,6 @@ async function runCycle(api, threadID, run) {
 module.exports = {
   name: 'بانكاي',
 
-  callGroupMemberAction,
-
   async execute(api, event) {
     const threadID = String(event.threadID || '');
     const body = (event.body || '').trim();

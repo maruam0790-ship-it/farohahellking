@@ -1,11 +1,12 @@
-function formatUptime(totalSeconds) {
+function formatDuration(totalSeconds) {
   const seconds = Math.max(0, Math.floor(totalSeconds));
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
-  const pad = (value) => String(value).padStart(2, "0");
+  const remainingSeconds = seconds % 60;
+  const number = (value) => new Intl.NumberFormat("ar-EG").format(value);
 
-  return `${pad(days)}D • ${pad(hours)}H • ${pad(minutes)}M`;
+  return `${number(days)} يوم  •  ${number(hours)} ساعة  •  ${number(minutes)} دقيقة  •  ${number(remainingSeconds)} ثانية`;
 }
 
 module.exports = {
@@ -13,17 +14,24 @@ module.exports = {
 
   async execute(api, event) {
     const threadID = String(event.threadID);
-    const uptime = formatUptime(process.uptime());
+    const requestedAt = new Intl.DateTimeFormat("ar-EG", {
+      timeZone: "Africa/Cairo",
+      dateStyle: "full",
+      timeStyle: "short",
+    }).format(new Date());
+    const uptime = formatDuration(process.uptime());
 
     const message = [
-      "|🩸 𓆩 𝑭𝑨𝑹𝑨𝑯 𓆪 🩸|",
-      "  ☠️ 𝑲𝑨𝒀𝑫𝑶 𝑺𝒀𝑺𝑻𝑬𝑴",
-      "◈ CONNECTION : ONLINE",
-      "◈ STATUS : ACTIVE",
-      `◈ UPTIME : ${uptime}`,
-      "◈ SERVICE : MESSENGER",
-      "| ⛧ 𝑭𝑨𝑹𝑨𝑯 𝑺𝒀𝑵𝑫𝑰𝑪𝑨𝑻𝑬 ⛧ |",
-      "|🩸 ━━━━━━━━━━━━━ 🩸|",
+      "━━━━━━━━(楽)┊ 𝗕𝗢𝗥𝗡 𝗧𝗢 𝗥𝗨𝗟𝗘 ༐ 𝆺𝅥 𝗭𝗘𝗗 ┊ (楽)━━━━━━━━",
+      "༐ 𝆺𝅥 𝗕𝗢𝗧 𝗦𝗬𝗦𝗧𝗘𝗠 𝗦𝗧𝗔𝗧𝗨𝗦 𝆺𝅥 ༐",
+      "╭━━━━━━━━━━━━━━━━━━╮",
+      "🔌┊ حالة الاتصال: 🟢 متصل — تم استلام الأمر",
+      "⚙️┊ حالة البوت: 🟢 نشط ويعمل الآن",
+      `⏱️┊ مدة التشغيل: ${uptime}`,
+      "📡┊ الخدمة: Facebook Messenger",
+      `🕒┊ وقت الاستعلام: ${requestedAt}`,
+      "╰━━━━━━━━━━━━━━━━━━╯",
+      "━━━━━━━(楽)┊ 𝗭𝗘𝗗 𝗕𝗢𝗧 ┊ (楽)━━━━━━━",
     ].join("\n");
 
     await api.sendMessage(message, threadID);

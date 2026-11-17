@@ -1,308 +1,389 @@
-// ─── صمّام الأمان العالمي: لا يموت البوت أبداً ───
+const path = require("path");
+const { login } = require("ws3-fca");
+const { loadCommands, handleMessage, handleEvent, commands } = require("./main");
+const { loadConfig, ConfigError } = require("./config");
+const { createLogger } = require("./logger");
+const { acquireLock } = require("./process-lock");
+const { createSessionStore, validateAppState } = require("./session-store");
+const { createConnectionState } = require("./connection-state");
+const { createListenerSession, silenceStatus } = require("./listener-session");
+const { classifyError } = require("./login-errors");
+const { computeBackoffDelay } = require("./backoff");
+const { createMessageDeduper } = require("./message-dedup");
+const { createMemoryMonitor } = require("./memory-monitor");
+const { createHealthServer } = require("./health-server");
+const { createKeepAlive } = require("./keep-alive");
+const { RESTART_EXIT_CODE } = require("./supervisor");
+
+const LOGIN_OPTIONS = {
+  listenEvents: true,
+  selfListen: false,
+  autoMarkDelivery: false,
+  autoMarkRead: false,
+  forceLogin: false,
+  autoReconnect: false,
+  online: true,
+};
+
+let config;
+try {
+  config = loadConfig();
+} catch (error) {
+  console.error(error instanceof ConfigError ? error.message : error);
+  process.exit(1);
+}
+
+const log = createLogger();
+const SESSION_FILE = config.appstatePath || path.join(__dirname, "appstate.json");
+const isSupervised = process.env.BOT_SUPERVISED === "1";
+const conn = createConnectionState();
+const sessionStore = createSessionStore({ filePath: SESSION_FILE, log });
+const deduper = createMessageDeduper();
+
+let releaseLock = () => {};
+if (!isSupervised) {
+  try {
+    releaseLock = acquireLock(path.join(__dirname, "data", "bot.lock"));
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+}
+
 let botApi = null;
-let msgEmitter = null;
-let isRestarting = false;
-let reconnectAttempts = 0;
-let heartbeatInterval = null;
+const listener = createListenerSession({ log });
+let stableTimer = null;
+let loginInFlight = false;
+let reconnectTimer = null;
+let shuttingDown = false;
+let silenceWarned = false;
+let monitorTimer = null;
+let sessionTimer = null;
+let keepAlive = null;
 
-process.on('uncaughtException', (err) => {
-  console.error('[الأسطورة جان] 🔴 خطأ غير متوقع:', err && err.message ? err.message : String(err));
-  console.log('[الأسطورة جان] 🟢 استمرار... إعادة الاتصال خلال 10 ثواني');
-  scheduleRestart(10000);
-});
+function alertOwner(key, text) {
+  log.error("alert", text);
+  if (!config.alertThreadId || !botApi || !conn.shouldAlert(key)) return;
+  botApi
+    .sendMessage(`تنبيه: ${text}`, config.alertThreadId)
+    .catch((error) => log.warn("alert", "تعذر إرسال التنبيه إلى المالك", { message: error.message }));
+}
 
-process.on('unhandledRejection', (reason) => {
-  console.error('[الأسطورة جان] 🔴 وعد غير معالج:', reason && reason.message ? reason.message : String(reason));
-  console.log('[الأسطورة جان] 🟢 استمرار...');
-});
+function markAttention(key, text) {
+  alertOwner(key, text);
+  stopListener(key);
+  conn.markNeedsAttention(text);
+}
 
-process.on('SIGTERM', () => {
-  console.log('[الأسطورة جان] ⚠️ استلمت SIGTERM — البوت يتجاهلها ويكمل');
-});
+function clearStableTimer() {
+  if (stableTimer) clearTimeout(stableTimer);
+  stableTimer = null;
+}
 
-process.on('SIGHUP', () => {
-  console.log('[الأسطورة جان] ⚠️ استلمت SIGHUP — البوت يتجاهلها ويكمل');
-});
+function armStableReset() {
+  clearStableTimer();
+  stableTimer = setTimeout(() => {
+    stableTimer = null;
+    conn.resetAttempts();
+    log.info("listener", "الاتصال مستقر، تم تصفير عدادات إعادة المحاولة");
+  }, config.reconnectStableSeconds * 1000);
+}
 
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
-const { login } = require('ws3-fca');
-const { loadCommands, handleMessage, handleEvent, commands } = require('./main');
+function stopListener(reason) {
+  clearStableTimer();
+  listener.stop(reason);
+  botApi = null;
+  conn.markListenerStopped();
+  const pin = commands.get("تثبيت");
+  if (pin && pin.stopAll) pin.stopAll();
+  log.info("listener", "تم إيقاف مستمع الرسائل", { reason });
+}
 
-const PORT = process.env.PORT || 3000;
-const app = express();
+function persistSession() {
+  if (!botApi) return;
+  try {
+    if (sessionStore.save(botApi.getAppState())) log.info("session", "تم حفظ الجلسة");
+  } catch (error) {
+    log.warn("session", "تعذر حفظ الجلسة", { message: error.message });
+  }
+}
 
-app.get('/', (req, res) => {
-  res.json({
-    status: botApi ? '🟢 بوت الأسطورة جان يعمل' : '🔴 جاري إعادة الاتصال...',
-    bot: 'الأسطورة جان',
-    loggedIn: !!botApi,
-    uptime: Math.floor(process.uptime()) + ' ثانية',
-    reconnectAttempts,
-    timestamp: new Date().toISOString()
+function scheduleReconnect(reason, kind = "mqtt") {
+  if (shuttingDown || reconnectTimer) return;
+  if (!config.reconnectEnabled) {
+    conn.setStatus("stopped");
+    log.warn("listener", "إعادة الاتصال التلقائي معطلة", { reason });
+    return;
+  }
+
+  const attempt = conn.markReconnectAttempt(kind);
+  if (config.maxRestartAttempts > 0 && attempt > config.maxRestartAttempts) {
+    markAttention(`${kind}_limit`, "تجاوز عدد محاولات إعادة الاتصال الحد المسموح، يلزم التدخل اليدوي");
+    return;
+  }
+
+  const delay = computeBackoffDelay({
+    attempt,
+    initialMs: config.reconnectInitialDelay * 1000,
+    maxMs: config.reconnectMaxDelay * 1000,
+    jitterRatio: config.reconnectJitter,
   });
-});
+  conn.setStatus("reconnecting");
+  log.warn("listener", "انقطع الاتصال، جاري إعادة المحاولة", {
+    reason,
+    attempt,
+    delaySeconds: Math.round(delay / 1000),
+  });
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startBot();
+  }, delay);
+}
 
-app.get('/ping', (req, res) => res.send('pong - الأسطورة جان حي ويعمل 💀'));
-
-app.get('/testsend', async (req, res) => {
-  const threadID = req.query.thread;
-  if (!threadID || !botApi) return res.status(400).json({ error: 'bot not ready' });
-  try {
-    await botApi.sendMessage('💀 تجريبة إرسال', threadID);
-    res.json({ success: true, threadID });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/updatecookies', express.json(), (req, res) => {
-  const appstatePath = path.join(__dirname, 'appstate.json');
-  try {
-    const cookies = req.body;
-    if (!Array.isArray(cookies) || cookies.length === 0)
-      return res.status(400).json({ error: 'Invalid cookies format.' });
-    fs.writeFileSync(appstatePath, JSON.stringify(cookies, null, 2));
-    console.log('[الأسطورة جان] ✅ تم تحديث الكوكيز عبر HTTP');
-    res.json({ success: true, message: 'Cookies updated. Reconnecting...' });
-    scheduleRestart(3000);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`[الأسطورة جان] 🌐 خادم Uptime يعمل على المنفذ ${PORT}`);
-});
-
-// ─── Heartbeat كل 30 ثانية ───
-function startHeartbeat(api) {
-  if (heartbeatInterval) clearInterval(heartbeatInterval);
-  heartbeatInterval = setInterval(() => {
-    try {
-      if (api && api.getCurrentUserID) {
-        api.getCurrentUserID();
-        console.log('[الأسطورة جان] 💓 Heartbeat');
-      }
-    } catch (e) {
-      console.error('[الأسطورة جان] ⚠️ Heartbeat failed:', e.message);
+function onListenerEvent(api, err, event) {
+  if (err) {
+    const kind = classifyError(err);
+    conn.markError(kind);
+    log.error("listener", "خطأ في مستمع الرسائل", {
+      kind,
+      message: err.message || err.error || err,
+    });
+    if (kind === "checkpoint") {
+      markAttention("checkpoint", "فيسبوك طلب تحققا أمنيا أو قيد الحساب. أوقفت المحاولات، راجع الحساب ثم حدّث الكوكيز");
+      return;
     }
-  }, 30000);
-}
-
-// ─── تنظيف الذاكرة كل 10 دقائق ───
-function startMemorySweeper(api) {
-  setInterval(() => {
-    try {
-      if (api && api._msgQueue && Array.isArray(api._msgQueue)) api._msgQueue = [];
-      if (api && api._messageCache) {
-        const keys = Object.keys(api._messageCache);
-        if (keys.length > 50) keys.slice(0, keys.length - 50).forEach(k => delete api._messageCache[k]);
-      }
-      if (api && api._threadCache) {
-        const keys = Object.keys(api._threadCache);
-        if (keys.length > 20) keys.slice(0, keys.length - 20).forEach(k => delete api._threadCache[k]);
-      }
-      if (typeof global.gc === 'function') global.gc();
-      console.log('[SYSTEM] 🟢 تنظيف الذاكرة');
-    } catch (e) {}
-  }, 10 * 60 * 1000);
-}
-
-// ─── حفظ appstate كل 30 دقيقة ───
-function startAppstateSaver(api) {
-  setInterval(() => {
-    try {
-      const state = api.getAppState();
-      if (state && state.length > 0) {
-        fs.writeFileSync(path.join(__dirname, 'appstate.json'), JSON.stringify(state, null, 2));
-      }
-    } catch (e) {}
-  }, 30 * 60 * 1000);
-}
-
-// ─── المحرك الرئيسي: يعيد المحاولة دائماً ───
-function startBot() {
-  if (isRestarting) return;
-
-  const appstatePath = path.join(__dirname, 'appstate.json');
-
-  // لو الملف مش موجود → ننتظر ونحاول مجدداً
-  if (!fs.existsSync(appstatePath)) {
-    console.error('[الأسطورة جان] ❌ appstate.json غير موجود — إعادة المحاولة بعد 30 ثانية');
-    setTimeout(startBot, 30000);
+    if (kind === "session_expired") {
+      markAttention("session_expired", "انتهت صلاحية جلسة فيسبوك. حدّث الكوكيز عبر لوحة الإدارة");
+      return;
+    }
+    stopListener("mqtt_error");
+    scheduleReconnect("mqtt_error");
     return;
   }
 
-  let appstate;
-  try {
-    appstate = JSON.parse(fs.readFileSync(appstatePath, 'utf8'));
-  } catch (e) {
-    console.error('[الأسطورة جان] ❌ خطأ في قراءة appstate.json:', e.message, '— إعادة بعد 30 ثانية');
-    setTimeout(startBot, 30000);
+  if (!event) return;
+  conn.markEvent();
+
+  if (event.type === "message" || event.type === "message_reply") {
+    if (!deduper.claim(event.messageID)) return;
+    conn.markMessage();
+    Promise.resolve(handleMessage(api, event)).catch((error) =>
+      log.error("messages", "خطأ في معالجة رسالة", { message: error.message || error }),
+    );
     return;
   }
 
-  console.log('[الأسطورة جان] 🚀 جاري تسجيل الدخول...');
-
-  login(
-    { appState: appstate },
-    {
-      listenEvents: true,
-      selfListen: false,
-      autoMarkDelivery: false,
-      autoMarkRead: false,
-      forceLogin: false,
-      autoReconnect: true,
-      online: true
-    },
-    (err, api) => {
-      if (err) {
-        const errStr = JSON.stringify(err);
-        console.error('[الأسطورة جان] ❌ فشل تسجيل الدخول:', errStr);
-        const errMsg = String(err.message || err.error || errStr);
-
-        // فيسبوك حظر الجلسة → انتظر 5 دقائق
-        if (errMsg.includes('retrieving userID') || errMsg.includes('blocked') || errMsg.includes('unknown location') || errMsg.includes('checkpoint')) {
-          console.log('[الأسطورة جان] 🔴 checkpoint أو حظر — إعادة بعد 5 دقائق');
-          isRestarting = false;
-          setTimeout(startBot, 5 * 60 * 1000);
-          return;
-        }
-
-        // أي خطأ آخر → انتظر مع backoff (15ث → 30ث → 60ث → 120ث max)
-        reconnectAttempts++;
-        const delay = Math.min(15000 * reconnectAttempts, 120000);
-        console.log(`[الأسطورة جان] ⏳ إعادة بعد ${delay / 1000}ث (محاولة ${reconnectAttempts})`);
-        isRestarting = false;
-        setTimeout(startBot, delay);
-        return;
-      }
-
-      console.log('[الأسطورة جان] ✅ تم تسجيل الدخول!');
-      isRestarting = false;
-      reconnectAttempts = 0;
-      botApi = api;
-
-      // حفظ فوري للـ appstate
-      try {
-        const state = api.getAppState();
-        if (state && state.length > 0)
-          fs.writeFileSync(appstatePath, JSON.stringify(state, null, 2));
-        console.log('[الأسطورة جان] 💾 تم تحديث appstate.json');
-      } catch (e) {}
-
-      const ctx = api.ctx;
-      if (ctx && ctx.lastSeqId) {
-        ctx.firstListen = true;
-        console.log(`[الأسطورة جان] 🔑 Sequence ID: ${ctx.lastSeqId}`);
-      } else {
-        console.log('[الأسطورة جان] ⚠️ لم يُعثر على irisSeqID');
-      }
-
-      loadCommands();
-      startListening(api);
-      startHeartbeat(api);
-      startMemorySweeper(api);
-      startAppstateSaver(api);
-
-      // استئناف حلقات القصف بعد إعادة الاتصال
-      try {
-        const { commands } = require('./main');
-        const qasf = commands.get('قصف');
-        if (qasf && qasf.resumeAll) qasf.resumeAll(api);
-      } catch (e) {
-        console.error('[الأسطورة جان] خطأ في استئناف الحمايات:', e.message);
-      }
-
-      console.log('[الأسطورة جان] 🤖 بوت "الأسطورة جان" يعمل — لا يتوقف أبداً 💀');
-      console.log('[الأسطورة جان] ─────────────────────────────────');
-      console.log('[الأسطورة جان] 📋 الأوامر المتاحة:');
-      console.log('[الأسطورة جان]   • زيد تشغيل / زيد إيقاف');
-      console.log('[الأسطورة جان]   • بانكاي [ID] / بانكاي ايقاف');
-      console.log('[الأسطورة جان]   • قصف / قصف ايقاف');
-      console.log('[الأسطورة جان]   • ماهوراغا / ماهوراغا ايقاف');
-      console.log('[الأسطورة جان]   • كاتش / مجموعة / جروب');
-      console.log('[الأسطورة جان]   • تثبيت (بالرد على صورة)');
-      console.log('[الأسطورة جان]   • رد [كلمة]» [رد]');
-      console.log('[الأسطورة جان]   • حالة');
-      console.log('[الأسطورة جان]   • يوت [اسم المقطع]');
-      console.log('[الأسطورة جان] ─────────────────────────────────');
-    }
-  );
+  try {
+    handleEvent(api, event);
+  } catch (error) {
+    log.error("messages", "خطأ في معالجة حدث", { message: error.message });
+  }
 }
 
-// ─── مستمع الأحداث ───
 async function startListening(api) {
   try {
-    const callback = (err, event) => {
-      if (err) {
-        console.error('[الأسطورة جان] ⚠️ خطأ في الاستماع:', JSON.stringify(err));
-        const errMsg = String(err.message || err.error || err);
-
-        // أخطاء جلسة → أعد تسجيل الدخول
-        if (errMsg.includes('Not logged in') || errMsg.includes('sequence ID') ||
-            errMsg.includes('appstate') || errMsg.includes('Failed to get')) {
-          scheduleRestart(15000);
-        } else {
-          scheduleRestart(5000);
-        }
-        return;
-      }
-
-      if (!event) return;
-      try {
-        const type = event.type || 'unknown';
-        const threadID = String(event.threadID || '');
-        const senderID = String(event.senderID || '');
-        const body = (event.body || '').substring(0, 50);
-        if (type !== 'typ' && type !== 'read_receipt') {
-          console.log(`[الأسطورة جان] 📩 type=${type} thread=${threadID} sender=${senderID} body="${body}"`);
-        }
-        if (type === 'message' || type === 'message_reply') {
-          handleMessage(api, event);
-        } else {
-          handleEvent(api, event);
-        }
-      } catch (e) {
-        console.error('[الأسطورة جان] ⚠️ خطأ في معالجة الحدث:', e.message);
-      }
-    };
-
-    msgEmitter = await api.listenMqtt(callback);
-    console.log('[الأسطورة جان] 👂 البوت يستمع...');
-  } catch (e) {
-    console.error('[الأسطورة جان] ❌ استثناء في startListening:', e.message);
-    scheduleRestart(10000);
+    const result = await listener.start(api, (err, event) => onListenerEvent(api, err, event));
+    if (!result.started) return;
+    conn.markListenerStarted();
+    armStableReset();
+    log.info("listener", "مستمع الرسائل يعمل");
+  } catch (error) {
+    log.error("listener", "فشل بدء مستمع الرسائل", { message: error.message });
+    scheduleReconnect("listen_start_failed", "mqtt");
   }
 }
 
-// ─── جدولة إعادة الاتصال: لا تُكرر إذا كانت جارية ───
-function scheduleRestart(delay) {
-  if (isRestarting) return;
-  isRestarting = true;
+function onLogin(err, api) {
+  loginInFlight = false;
+  if (shuttingDown) return;
 
-  try { if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; } } catch (e) {}
-  try { if (msgEmitter && typeof msgEmitter.stop === 'function') msgEmitter.stop(); } catch (e) {}
+  if (err) {
+    const kind = classifyError(err);
+    conn.markError(kind);
+    if (kind === "checkpoint") {
+      markAttention("checkpoint", "فيسبوك طلب تحققا أمنيا أو قيد الحساب. أوقفت المحاولات، راجع الحساب ثم حدّث الكوكيز");
+      return;
+    }
+    if (kind === "session_expired") {
+      markAttention("session_expired", "انتهت صلاحية جلسة فيسبوك. حدّث الكوكيز عبر لوحة الإدارة");
+      return;
+    }
+    log.error("login", "فشل تسجيل الدخول", { kind, message: err.message || err.error || err });
+    scheduleReconnect("login_failed", "login");
+    return;
+  }
+
+  botApi = api;
+  conn.markLoginSuccess();
+  log.info("login", "تم تسجيل الدخول بنجاح");
+  persistSession();
+
+  if (api.ctx && api.ctx.lastSeqId) api.ctx.firstListen = true;
+  loadCommands();
+  startListening(api);
+
   try {
-    const pin = commands.get('تثبيت');
-    if (pin && pin.stopAll) pin.stopAll();
-  } catch (e) {
-    console.error('[الأسطورة جان] خطأ في إيقاف التثبيت:', e.message || e);
+    const qasf = commands.get("قصف");
+    if (qasf && qasf.resumeAll) qasf.resumeAll(api);
+  } catch (error) {
+    log.error("commands", "خطأ في استئناف قصف", { message: error.message });
   }
-
-  msgEmitter = null;
-  botApi = null;
-
-  reconnectAttempts++;
-  const actualDelay = Math.min(delay * Math.max(reconnectAttempts, 1), 120000);
-  console.log(`[الأسطورة جان] ⏳ إعادة الاتصال بعد ${actualDelay / 1000}ث (محاولة ${reconnectAttempts})`);
-
-  setTimeout(() => {
-    isRestarting = false;
-    startBot();
-  }, actualDelay);
 }
 
-startBot();
+function startBot() {
+  if (shuttingDown || loginInFlight || listener.active) return;
+
+  const appState = sessionStore.load();
+  if (!appState) {
+    markAttention("missing_session", "لا توجد جلسة فيسبوك صالحة. حدّث الكوكيز عبر لوحة الإدارة");
+    return;
+  }
+
+  loginInFlight = true;
+  conn.setStatus("connecting");
+  log.info("login", "جاري تسجيل الدخول");
+  login({ appState }, LOGIN_OPTIONS, onLogin);
+}
+
+function pruneApiCaches(api) {
+  if (!api) return;
+  if (Array.isArray(api._msgQueue)) api._msgQueue = [];
+  for (const [cacheName, keep] of [["_messageCache", 50], ["_threadCache", 20]]) {
+    const cache = api[cacheName];
+    if (!cache) continue;
+    const keys = Object.keys(cache);
+    if (keys.length > keep) keys.slice(0, keys.length - keep).forEach((k) => delete cache[k]);
+  }
+}
+
+const memoryMonitor = createMemoryMonitor({
+  warnMb: config.memoryWarningMb,
+  restartMb: config.memoryRestartMb,
+  confirmChecks: config.memoryConfirmChecks,
+  cooldownMs: config.memoryRestartCooldown * 1000,
+  uptimeMs: () => process.uptime() * 1000,
+  onWarn: (snapshot) => log.warn("memory", "استهلاك الذاكرة مرتفع", snapshot),
+  onRestartRequest: (snapshot) => {
+    log.warn("memory", "تجاوز استهلاك الذاكرة الحد المحدد، سيُعاد تشغيل الخدمة", {
+      ...snapshot,
+      limitMb: config.memoryRestartMb,
+    });
+    shutdown("memory_limit", RESTART_EXIT_CODE);
+  },
+});
+
+function monitorTick() {
+  memoryMonitor.check();
+  pruneApiCaches(botApi);
+
+  const snap = conn.snapshot();
+  const silentMs = snap.lastEventAt ? Date.now() - snap.lastEventAt : 0;
+  const status = silenceStatus({
+    listenerActive: snap.listenerActive,
+    lastEventAt: snap.lastEventAt,
+    now: Date.now(),
+    limitMs: config.listenerSilenceWarn * 1000,
+  });
+  if (status === "silent") {
+    if (!silenceWarned) {
+      silenceWarned = true;
+      log.warn("listener", "لم تصل أي أحداث من فيسبوك منذ فترة طويلة", {
+        silentSeconds: Math.round(silentMs / 1000),
+      });
+    }
+  } else {
+    silenceWarned = false;
+  }
+}
+
+async function testSend(threadID) {
+  if (!botApi) return { ok: false, error: "not_ready" };
+  try {
+    await botApi.sendMessage("💀 تجريبة إرسال", threadID);
+    return { ok: true, threadID };
+  } catch (error) {
+    log.warn("send", "فشل الإرسال التجريبي", { message: error.message });
+    return { ok: false, error: "send_failed" };
+  }
+}
+
+function updateCookies(body) {
+  const check = validateAppState(body);
+  if (!check.ok) return { ok: false, error: check.reason };
+  try {
+    sessionStore.save(body);
+  } catch (error) {
+    log.error("session", "تعذر حفظ الجلسة الجديدة", { message: error.message });
+    return { ok: false, error: "save_failed" };
+  }
+  log.info("session", "تم تحديث الجلسة عبر لوحة الإدارة، جاري إعادة الاتصال");
+  stopListener("cookies_updated");
+  conn.resetAttempts();
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startBot();
+  }, 3000);
+  return { ok: true };
+}
+
+const healthServer = createHealthServer({
+  connectionState: conn,
+  adminToken: config.botAdminToken,
+  handlers: { testSend, updateCookies },
+  log,
+});
+
+function shutdown(reason, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  conn.setStatus("stopping");
+  log.info("shutdown", "جاري إيقاف الخدمة بشكل آمن", { reason });
+
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (monitorTimer) clearInterval(monitorTimer);
+  if (sessionTimer) clearInterval(sessionTimer);
+  if (keepAlive) keepAlive.stop();
+  persistSession();
+  stopListener("shutdown");
+  healthServer.close().catch(() => {});
+  releaseLock();
+  process.exit(exitCode);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGHUP", () => log.info("bot", "تم استلام SIGHUP وتجاهله"));
+process.on("uncaughtException", (error) => {
+  log.error("fatal", "خطأ غير متوقع", { message: error.message });
+  shutdown("uncaught_exception", 1);
+});
+process.on("unhandledRejection", (reason) => {
+  log.error("fatal", "وعد غير معالج", { message: reason && reason.message ? reason.message : String(reason) });
+});
+
+async function boot() {
+  const port = await healthServer.listen(config.port);
+  log.info("bot", "بدء تشغيل البوت", { port, supervised: isSupervised, pid: process.pid });
+
+  if (config.monitoringEnabled) {
+    monitorTimer = setInterval(monitorTick, config.healthCheckInterval * 1000);
+  }
+  sessionTimer = setInterval(persistSession, config.sessionSaveInterval * 1000);
+
+  if (config.keepAliveEnabled) {
+    keepAlive = createKeepAlive({
+      url: `${config.publicBaseUrl}/health`,
+      intervalMs: config.keepAliveInterval * 1000,
+      log,
+    });
+    keepAlive.start();
+  }
+
+  startBot();
+}
+
+boot().catch((error) => {
+  log.error("fatal", "تعذر بدء الخدمة", { message: error.message });
+  shutdown("boot_failed", 1);
+});

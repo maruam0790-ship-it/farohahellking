@@ -34,6 +34,15 @@ node_modules
 /bot/data/youtube-state.json*
 /bot/data/newspaper.json
 /bot/data/zed-state.json
+/bot/data/bot.lock
+/bot/data/crash-history.json
+/bot/appstate.json
+/bot/appstate.json.*
+/bot/account.txt
+/bot/appstate.json.bak.*
+/bot/**/*cookie*
+/bot/**/*token*.json
+/bot/logs/
 /libpeerconnection.log
 npm-debug.log
 yarn-error.log
@@ -51,3 +60,6 @@ Thumbs.db
 .cache/
 .local/
 .env
+.env.*
+!.env.example
+**/*.env.local

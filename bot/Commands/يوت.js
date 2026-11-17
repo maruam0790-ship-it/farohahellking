@@ -2,17 +2,18 @@ const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-// استخدام أدوات النظام المثبتة في بيئة التشغيل.
-const YTDL_PATH = 'yt-dlp';
-const DENO_PATH = process.env.DENO_BIN || 'deno';
+// yt-dlp و ffmpeg مثبتان في مسار النظام.
+const YTDL_PATH = process.env.YTDL_PATH || 'yt-dlp';
+const FFMPEG_PATH = process.env.FFMPEG_PATH || '/usr/local/bin/ffmpeg';
 const YOUTUBE_STATE_PATH = path.join(__dirname, '..', 'data', 'youtube-state.json');
 
 function downloadAudio(query, outFile) {
   return new Promise((resolve, reject) => {
     const safeQuery = query.replace(/"/g, '\\"').replace(/`/g, '');
 
-    // البحث في SoundCloud بدلًا من YouTube
-    const cmd = `"${YTDL_PATH}" --js-runtimes "deno:${DENO_PATH}" --remote-components ejs:github "scsearch1:${safeQuery}" -f bestaudio --no-playlist -o "${outFile}"`;
+    // البحث في SoundCloud وتحويل المقطع إلى mp3 بجودة متوسطة لتقليل الحجم.
+    const outTemplate = outFile.replace(/\.mp3$/, '.%(ext)s');
+    const cmd = `"${YTDL_PATH}" "scsearch1:${safeQuery}" -x --audio-format mp3 --audio-quality 5 --no-playlist --download-sections "*0-360" --force-keyframes-at-cuts --ffmpeg-location "${FFMPEG_PATH}" -o "${outTemplate}"`;
     console.log(`[يوت] تنفيذ: ${cmd}`);
 
     exec(cmd, { timeout: 150000 }, (err, stdout, stderr) => {

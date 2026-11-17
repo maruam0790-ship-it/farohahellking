@@ -11,8 +11,8 @@ function downloadAudio(query, outFile) {
   return new Promise((resolve, reject) => {
     const safeQuery = query.replace(/"/g, '\\"').replace(/`/g, '');
 
-    // استخدام Deno كـ JavaScript runtime لمساعدة yt-dlp مع YouTube
-    const cmd = `"${YTDL_PATH}" --js-runtimes "deno:${DENO_PATH}" --remote-components ejs:github --extractor-args "youtube:player_client=web_embedded" "ytsearch1:${safeQuery}" -x --audio-format mp3 --audio-quality 0 --no-playlist -o "${outFile}"`;
+    // البحث في SoundCloud بدلًا من YouTube
+    const cmd = `"${YTDL_PATH}" --js-runtimes "deno:${DENO_PATH}" --remote-components ejs:github "scsearch1:${safeQuery}" -f bestaudio --no-playlist -o "${outFile}"`;
     console.log(`[يوت] تنفيذ: ${cmd}`);
 
     exec(cmd, { timeout: 150000 }, (err, stdout, stderr) => {

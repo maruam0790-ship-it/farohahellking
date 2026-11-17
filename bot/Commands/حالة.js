@@ -1,12 +1,16 @@
-function formatDuration(totalSeconds) {
+function formatUptime(totalSeconds) {
   const seconds = Math.max(0, Math.floor(totalSeconds));
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const remainingSeconds = seconds % 60;
-  const number = (value) => new Intl.NumberFormat("ar-EG").format(value);
+  return `${days}D • ${hours}H • ${minutes}M • ${remainingSeconds}S`;
+}
 
-  return `${number(days)} يوم  •  ${number(hours)} ساعة  •  ${number(minutes)} دقيقة  •  ${number(remainingSeconds)} ثانية`;
+function formatRam() {
+  const m = process.memoryUsage();
+  const toMB = (bytes) => (bytes / 1024 / 1024).toFixed(1);
+  return `${toMB(m.rss)} MB / ${toMB(m.heapTotal)} MB`;
 }
 
 module.exports = {
@@ -14,24 +18,31 @@ module.exports = {
 
   async execute(api, event) {
     const threadID = String(event.threadID);
-    const requestedAt = new Intl.DateTimeFormat("ar-EG", {
+    const requestedAt = new Intl.DateTimeFormat("en-US", {
       timeZone: "Africa/Cairo",
       dateStyle: "full",
       timeStyle: "short",
     }).format(new Date());
-    const uptime = formatDuration(process.uptime());
+    const uptime = formatUptime(process.uptime());
+    const ram = formatRam();
 
     const message = [
-      "━━━━━━━━(楽)┊ 𝗕𝗢𝗥𝗡 𝗧𝗢 𝗥𝗨𝗟𝗘 ༐ 𝆺𝅥 𝗭𝗘𝗗 ┊ (楽)━━━━━━━━",
-      "༐ 𝆺𝅥 𝗕𝗢𝗧 𝗦𝗬𝗦𝗧𝗘𝗠 𝗦𝗧𝗔𝗧𝗨𝗦 𝆺𝅥 ༐",
+      "| ━━━━━━━ 𖤐 ━━━━━━━ |",
+      "       𓆩 𝑭𝑨𝑹𝑨𝑯 𓆪",
+      "        𝑲𝑨𝒀𝑫𝑶 𝑺𝒀𝑺𝑻𝑬𝑴",
+      "| ━━━━━━━━━━━━━━━━━ |",
+      "",
       "╭━━━━━━━━━━━━━━━━━━╮",
-      "🔌┊ حالة الاتصال: 🟢 متصل — تم استلام الأمر",
-      "⚙️┊ حالة البوت: 🟢 نشط ويعمل الآن",
-      `⏱️┊ مدة التشغيل: ${uptime}`,
-      "📡┊ الخدمة: Facebook Messenger",
-      `🕒┊ وقت الاستعلام: ${requestedAt}`,
+      " ┊ 𝑪𝒐𝒏𝒏𝒆𝒄𝒕𝒊𝒐𝒏 : ONLINE",
+      "⛧ ┊ 𝑺𝒚𝒔𝒕𝒆𝒎 : FULLY ACTIVE",
+      ` ┊ 𝑼𝒑𝒕𝒊𝒎𝒆 : ${uptime}`,
+      " ┊ 𝑺𝒆𝒓𝒗𝒊𝒄𝒆 : FACEBOOK MESSENGER",
+      ` ┊ 𝑹𝑨𝑴 : ${ram}`,
+      ` ┊ 𝑪𝒉𝒆𝒄𝒌 𝑻𝒊𝒎𝒆 : ${requestedAt}`,
       "╰━━━━━━━━━━━━━━━━━━╯",
-      "━━━━━━━(楽)┊ 𝗭𝗘𝗗 𝗕𝗢𝗧 ┊ (楽)━━━━━━━",
+      "",
+      "    ⛧ 𝑭𝑨𝑹𝑨𝑯 𝑺𝒀𝑵𝑫𝑰𝑪𝑨𝑻𝑬 ⛧",
+      "| ━━━━━━━ 𖤐 ━━━━━━━ |",
     ].join("\n");
 
     await api.sendMessage(message, threadID);

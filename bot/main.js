@@ -114,6 +114,18 @@ async function handleMessage(api, event) {
     return;
   }
 
+  if (body.toLowerCase() === "owner") {
+    const cmd = commands.get("Owner");
+    if (cmd) {
+      cmd
+        .execute(api, event)
+        .catch((e) =>
+          console.error("[الأسطورة جان] خطأ في أمر Owner:", e.message || e),
+        );
+    }
+    return;
+  }
+
   // سجّل الرسالة فور وصولها حتى يكون عدّاد الأربع ثوانٍ مبنياً
   // على ترتيب وصول الرسائل، وليس على وقت انتهاء أي رد تلقائي آخر.
   const mahoragaCmd = commands.get("ماهوراغا");
